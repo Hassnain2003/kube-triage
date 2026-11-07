@@ -1,0 +1,3 @@
+root_cause_category: imagepull_wrong_tag
+required_evidence:
+  - ImagePullBackOff
