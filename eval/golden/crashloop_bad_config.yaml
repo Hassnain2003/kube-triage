@@ -1,0 +1,4 @@
+root_cause_category: crashloop_bad_config
+required_evidence:
+  - CrashLoopBackOff
+  - CRASH_ON_START
