@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: demo
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: orders
+          image: kube-triage-orders:dev
+          env:
+            - name: CRASH_ON_START
+              value: "1"
+status:
+  readyReplicas: 0
+  replicas: 1

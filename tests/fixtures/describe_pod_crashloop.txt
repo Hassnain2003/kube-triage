@@ -1,0 +1,17 @@
+Name:         orders-6d7f9c4b8d-abcde
+Namespace:    demo
+Status:       Running
+Containers:
+  orders:
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    1
+    Ready:          False
+    Restart Count:  4
+Conditions:
+  Type              Status
+  Ready             False
+Events:
+  Warning  BackOff  10s (x8 over 45s)  kubelet  Back-off restarting failed container orders

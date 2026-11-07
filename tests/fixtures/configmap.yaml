@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-config
+  namespace: demo
+data:
+  REDIS_HOST: redis
+  CRASH_ON_START: "1"
+  API_TOKEN: super-secret-value
+  password: hunter2
