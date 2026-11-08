@@ -42,7 +42,7 @@ class LLMProvider(Protocol):
 class GroqProvider:
     def __init__(
         self,
-        api_key: str | None = None,
+        api_keys: list[str] | None = None,
         model: str | None = None,
         max_retries: int = 6,
         fallback_models: tuple[str, ...] | None = None,
@@ -54,10 +54,15 @@ class GroqProvider:
         self.stats = ProviderStats()
         self._max_retries = max_retries
         self._rate_limit_error = RateLimitError
-        key = api_key or os.environ.get("GROQ_API_KEY")
-        if not key:
-            raise RuntimeError("GROQ_API_KEY is not set")
-        self._client = Groq(api_key=key)
+        raw_keys = api_keys or os.environ.get("GROQ_API_KEYS") or os.environ.get("GROQ_API_KEY")
+        if not raw_keys:
+            raise RuntimeError("GROQ_API_KEYS (or GROQ_API_KEY) is not set")
+        self._keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        self._key_index = 0
+        self._clients = [Groq(api_key=k) for k in self._keys]
+
+    def _client_for_key(self, index: int):
+        return self._clients[index % len(self._clients)]
 
     def complete(
         self,
@@ -75,32 +80,36 @@ class GroqProvider:
             }
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
-            for attempt in range(self._max_retries):
-                try:
-                    self.stats.calls += 1
-                    response = self._client.chat.completions.create(**kwargs)
-                    choice = response.choices[0].message.content or ""
-                    usage = response.usage
-                    in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
-                    out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
-                    self.stats.input_tokens += in_tok
-                    self.stats.output_tokens += out_tok
-                    self.model = model
-                    return LLMResult(text=choice, input_tokens=in_tok, output_tokens=out_tok)
-                except self._rate_limit_error as exc:
-                    self.stats.retries_429 += 1
-                    last_error = exc
-                    time.sleep(min(32.0, 2**attempt))
-                except Exception as exc:
-                    # Groq returns 413 for TPM oversize; shrinking happens in the agent.
-                    if "rate_limit" in str(exc).lower() or "413" in str(exc):
+            # Try each API key on 429 before moving to the next model.
+            for key_idx in range(len(self._keys)):
+                for attempt in range(self._max_retries):
+                    try:
+                        self.stats.calls += 1
+                        response = self._client_for_key(key_idx).chat.completions.create(**kwargs)
+                        choice = response.choices[0].message.content or ""
+                        usage = response.usage
+                        in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
+                        out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+                        self.stats.input_tokens += in_tok
+                        self.stats.output_tokens += out_tok
+                        self.model = model
+                        self._key_index = key_idx
+                        return LLMResult(text=choice, input_tokens=in_tok, output_tokens=out_tok)
+                    except self._rate_limit_error as exc:
                         self.stats.retries_429 += 1
                         last_error = exc
                         time.sleep(min(32.0, 2**attempt))
-                        continue
-                    raise
+                        break  # try next key instead of retrying same key
+                    except Exception as exc:
+                        # Groq returns 413 for TPM oversize; shrinking happens in the agent.
+                        if "rate_limit" in str(exc).lower() or "413" in str(exc):
+                            self.stats.retries_429 += 1
+                            last_error = exc
+                            time.sleep(min(32.0, 2**attempt))
+                            break  # try next key
+                        raise
         raise RuntimeError(
-            f"Groq rate-limited on all models after {self._max_retries} retries: {last_error}"
+            f"Groq rate-limited on all keys/models after {self._max_retries} retries: {last_error}"
         )
 
 
