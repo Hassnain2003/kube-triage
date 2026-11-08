@@ -46,12 +46,26 @@ class ClusterTools:
             {"namespace": namespace},
             ["get", "events", "-n", namespace, "--sort-by=.lastTimestamp"],
         )
-        # Keep only the newest events; old events from previous faults pollute
-        # diagnosis (e.g. stale CrashLoopBackOff entries mask a readiness fault).
+        # Deduplicate repeated similar events and keep only the newest ones so stale
+        # crashloop entries from previous faults don't mask a readiness fault.
         lines = raw.splitlines()
-        if len(lines) > 25:
-            raw = "\n".join(lines[:1] + lines[-24:])
-        return raw
+        if len(lines) <= 25:
+            return raw
+        header = lines[0]
+        seen: set[str] = set()
+        kept: list[str] = [header]
+        for line in lines[1:]:
+            parts = line.split(None, 5)
+            if len(parts) >= 6:
+                dedup_key = "|".join(parts[2:6])  # TYPE, REASON, OBJECT, MESSAGE
+            else:
+                dedup_key = line
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            kept.append(line)
+        # Keep header + newest 24 deduped events.
+        return "\n".join([header] + kept[1:][-24:])
 
     def get_logs(
         self,

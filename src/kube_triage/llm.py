@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODELS = ("openai/gpt-oss-120b", "meta-llama/llama-3.1-8b-instant")
 
 
 @dataclass
@@ -44,10 +45,12 @@ class GroqProvider:
         api_key: str | None = None,
         model: str | None = None,
         max_retries: int = 6,
+        fallback_models: tuple[str, ...] | None = None,
     ) -> None:
         from groq import Groq, RateLimitError
 
         self.model = model or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
+        self.fallback_models = fallback_models or FALLBACK_MODELS
         self.stats = ProviderStats()
         self._max_retries = max_retries
         self._rate_limit_error = RateLimitError
@@ -62,38 +65,43 @@ class GroqProvider:
         *,
         json_mode: bool = False,
     ) -> LLMResult:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.0,
-        }
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
+        models = [self.model] + [m for m in self.fallback_models if m != self.model]
         last_error: Exception | None = None
-        for attempt in range(self._max_retries):
-            try:
-                self.stats.calls += 1
-                response = self._client.chat.completions.create(**kwargs)
-                choice = response.choices[0].message.content or ""
-                usage = response.usage
-                in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
-                out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
-                self.stats.input_tokens += in_tok
-                self.stats.output_tokens += out_tok
-                return LLMResult(text=choice, input_tokens=in_tok, output_tokens=out_tok)
-            except self._rate_limit_error as exc:
-                self.stats.retries_429 += 1
-                last_error = exc
-                time.sleep(min(32.0, 2**attempt))
-            except Exception as exc:
-                # Groq returns 413 for TPM oversize; shrinking happens in the agent.
-                if "rate_limit" in str(exc).lower() or "413" in str(exc):
+        for model in models:
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            for attempt in range(self._max_retries):
+                try:
+                    self.stats.calls += 1
+                    response = self._client.chat.completions.create(**kwargs)
+                    choice = response.choices[0].message.content or ""
+                    usage = response.usage
+                    in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
+                    out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+                    self.stats.input_tokens += in_tok
+                    self.stats.output_tokens += out_tok
+                    self.model = model
+                    return LLMResult(text=choice, input_tokens=in_tok, output_tokens=out_tok)
+                except self._rate_limit_error as exc:
                     self.stats.retries_429 += 1
                     last_error = exc
                     time.sleep(min(32.0, 2**attempt))
-                    continue
-                raise
-        raise RuntimeError(f"Groq rate-limited after {self._max_retries} retries: {last_error}")
+                except Exception as exc:
+                    # Groq returns 413 for TPM oversize; shrinking happens in the agent.
+                    if "rate_limit" in str(exc).lower() or "413" in str(exc):
+                        self.stats.retries_429 += 1
+                        last_error = exc
+                        time.sleep(min(32.0, 2**attempt))
+                        continue
+                    raise
+        raise RuntimeError(
+            f"Groq rate-limited on all models after {self._max_retries} retries: {last_error}"
+        )
 
 
 class FakeLLMProvider:

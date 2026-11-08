@@ -19,14 +19,32 @@ You diagnose broken deployments. You never change a cluster. You never suggest r
 kubectl apply yourself as an executed action; you only return text or a unified diff
 that a human can review.
 
-Allowed root_cause_category values:
-- crashloop_bad_config
-- oomkilled
-- imagepull_wrong_tag
-- readiness_dependency_down
-- wrong_dependency_url
-- worker_backlog
-- unknown
+Allowed root_cause_category values and how to recognize them:
+- crashloop_bad_config: pod in CrashLoopBackOff / BackOff restart loop, or
+  CRASH_ON_START env set, or connection refused on liveness probe with
+  RestartCount > 0. The container keeps dying on startup.
+- oomkilled: pod status OOMKilled, or container terminated with OOMKilled
+  reason, or memory limit far too low.
+- imagepull_wrong_tag: ImagePullBackOff or ErrImagePull, wrong image tag,
+  image not found.
+- readiness_dependency_down: pod is Running but not Ready (0/1), readiness
+  probe returns 503 or connection refused, dependency deployment (e.g.
+  redis) has replicas: 0 or is ScaledDown, dependency endpoints are empty.
+- wrong_dependency_url: ConfigMap has REDIS_HOST pointing to a
+  non-existent host (e.g. redis.invalid), or app logs show connection
+  refused to the dependency host.
+- worker_backlog: WORKER_STUCK=1 set, worker logs show stuck/slow
+  consumption, queue_length growing, API timeouts on /orders while orders
+  pod itself is healthy (Running, Ready).
+- unknown: no clear signal matches any category above.
+
+Disambiguation rules:
+- If a pod is CrashLoopBackOff → crashloop_bad_config, NOT
+  readiness_dependency_down.
+- If a pod is Running but 0/1 Ready AND a dependency deployment has
+  replicas: 0 → readiness_dependency_down.
+- If READINESS probe fails with 503 AND orders deployment is healthy →
+  readiness_dependency_down, not crashloop.
 
 {UNTRUSTED_HANDLING_RULES}
 
@@ -178,11 +196,20 @@ class TriageAgent:
     def _gather_evidence(self, state: AgentState) -> AgentState:
         ns = state["namespace"]
         list_out = self._run_tool("list_pods", {"namespace": ns}, state)
+        state["last_list_pods"] = list_out
         self._run_tool("get_events", {"namespace": ns}, state)
         for deploy in state.get("deployments", []):
             if len(self.tools.calls) >= self.max_tool_calls:
                 break
-            self._run_tool("get_deployment", {"namespace": ns, "name": deploy}, state)
+            raw = self._run_tool("get_deployment", {"namespace": ns, "name": deploy}, state)
+            excerpt = strip_deployment_yaml(raw)[:300]
+            state.setdefault("evidence_items", []).append(
+                {
+                    "tool": "get_deployment",
+                    "source_ref": f"get_deployment:{len(self.tools.calls)}",
+                    "excerpt": excerpt,
+                }
+            )
         self._run_tool(
             "get_configmap",
             {"namespace": ns, "name": state["configmap_name"]},
@@ -240,13 +267,48 @@ class TriageAgent:
 
     def _verify(self, state: AgentState) -> AgentState:
         requested = list((state.get("hypothesis") or {}).get("verify_tools") or [])
+        category = (state.get("hypothesis") or {}).get("root_cause_category", "unknown")
+        ns = state["namespace"]
+
+        # Targeted verification for the most likely category.
+        if category == "readiness_dependency_down":
+            for extra in [
+                ("get_deployment", {"name": "redis"}),
+                ("get_service_endpoints", {"name": "redis"}),
+                ("get_configmap", {"name": state["configmap_name"]}),
+            ]:
+                if len(self.tools.calls) >= self.max_tool_calls:
+                    break
+                name, args = extra
+                args = dict(args)
+                args.setdefault("namespace", ns)
+                try:
+                    self._run_tool(name, args, state)
+                except Exception as exc:  # noqa: BLE001
+                    state["evidence_blocks"].append(self._observe(name, f"tool error: {exc}"))
+        elif category == "crashloop_bad_config":
+            pods = parse_pod_names(state.get("last_list_pods", ""))
+            for pod in pods[:2]:
+                if len(self.tools.calls) >= self.max_tool_calls:
+                    break
+                try:
+                    self._run_tool(
+                        "get_logs",
+                        {"namespace": ns, "name": pod, "tail": 40, "previous": True},
+                        state,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    state["evidence_blocks"].append(
+                        self._observe(f"get_logs:{pod}", f"tool error: {exc}")
+                    )
+
         for item in requested[:3]:
             if len(self.tools.calls) >= self.max_tool_calls:
                 state["stopped_reason"] = "max_tool_calls"
                 break
             name = item.get("name")
             arguments = dict(item.get("arguments") or {})
-            arguments.setdefault("namespace", state["namespace"])
+            arguments.setdefault("namespace", ns)
             if not name:
                 continue
             try:
@@ -317,6 +379,51 @@ def compact_cluster_text(raw: str, limit: int = 900) -> str:
     if len(text) > limit:
         return text[:limit] + "\n...[truncated]..."
     return text
+
+
+def strip_deployment_yaml(raw: str) -> str:
+    """Drop bulky managedFields/status/metadata from a deployment YAML for token efficiency."""
+    try:
+        import yaml
+
+        parsed = yaml.safe_load(raw) or {}
+    except yaml.YAMLError:
+        return raw
+    spec = parsed.get("spec", {}) if isinstance(parsed, dict) else {}
+    template = spec.get("template", {}).get("spec", {}) if isinstance(spec, dict) else {}
+    containers = template.get("containers", []) if isinstance(template, dict) else []
+    clean_containers = []
+    for c in containers if isinstance(containers, list) else []:
+        if not isinstance(c, dict):
+            continue
+        clean_containers.append(
+            {
+                "name": c.get("name"),
+                "image": c.get("image"),
+                "imagePullPolicy": c.get("imagePullPolicy"),
+                "env": (
+                    [{"name": e.get("name"), "value": e.get("value")} for e in c.get("env", [])]
+                    if isinstance(c.get("env"), list)
+                    else None
+                ),
+                "resources": c.get("resources"),
+                "ports": c.get("ports"),
+                "livenessProbe": c.get("livenessProbe"),
+                "readinessProbe": c.get("readinessProbe"),
+            }
+        )
+    clean = {
+        "kind": parsed.get("kind") if isinstance(parsed, dict) else None,
+        "name": parsed.get("metadata", {}).get("name") if isinstance(parsed, dict) else None,
+        "namespace": (
+            parsed.get("metadata", {}).get("namespace") if isinstance(parsed, dict) else None
+        ),
+        "replicas": spec.get("replicas") if isinstance(spec, dict) else None,
+        "containers": clean_containers,
+    }
+    import json as _json
+
+    return _json.dumps(clean, indent=2)
 
 
 def parse_pod_statuses(list_pods_output: str) -> dict[str, str]:
