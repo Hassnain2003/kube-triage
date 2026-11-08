@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODELS = ("openai/gpt-oss-120b", "meta-llama/llama-3.1-8b-instant")
+FALLBACK_MODELS = ("openai/gpt-oss-120b",)
 
 
 @dataclass
