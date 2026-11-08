@@ -33,21 +33,6 @@ Numbers in this file come from `make eval` in this repository. They are not esti
 - Mean wall-clock seconds: 8.6
 - Total 429 retries: 3
 
-## Where the agent was wrong and why
-
-- `readiness_dependency_down` run 1: predicted `crashloop_bad_config` (correct=False, evidence_ok=False, stopped=completed, error=none)
-- `readiness_dependency_down` run 2: predicted `error` (correct=False, evidence_ok=False, stopped=error, error='dict' object has no attribute 'lower')
-- `readiness_dependency_down` run 3: predicted `crashloop_bad_config` (correct=False, evidence_ok=False, stopped=completed, error=none)
-- `readiness_dependency_down` run 4: predicted `error` (correct=False, evidence_ok=False, stopped=error, error='dict' object has no attribute 'lower')
-- `readiness_dependency_down` run 5: predicted `error` (correct=False, evidence_ok=False, stopped=error, error='dict' object has no attribute 'lower')
-- `wrong_dependency_url` run 1: predicted `readiness_dependency_down` (correct=False, evidence_ok=True, stopped=completed, error=none)
-- `wrong_dependency_url` run 3: predicted `unknown` (correct=False, evidence_ok=False, stopped=invalid_schema, error=none)
-- `worker_backlog` run 1: predicted `error` (correct=False, evidence_ok=False, stopped=error, error=Groq rate-limited after 6 retries: Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01kqcgm76qeggag1mx548fvxe3` service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 199325, Requested 3231. Please try again in 18m24.192s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}})
-- `worker_backlog` run 2: predicted `error` (correct=False, evidence_ok=False, stopped=error, error=Groq rate-limited after 6 retries: Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01kqcgm76qeggag1mx548fvxe3` service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 199077, Requested 3259. Please try again in 16m49.151999999s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}})
-- `worker_backlog` run 3: predicted `error` (correct=False, evidence_ok=False, stopped=error, error=Groq rate-limited after 6 retries: Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01kqcgm76qeggag1mx548fvxe3` service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 198834, Requested 3463. Please try again in 16m32.304s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}})
-- `worker_backlog` run 4: predicted `error` (correct=False, evidence_ok=False, stopped=error, error=Groq rate-limited after 6 retries: Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01kqcgm76qeggag1mx548fvxe3` service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 198586, Requested 3112. Please try again in 12m13.536s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}})
-- `worker_backlog` run 5: predicted `error` (correct=False, evidence_ok=False, stopped=error, error=Groq rate-limited after 6 retries: Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01kqcgm76qeggag1mx548fvxe3` service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 198339, Requested 4030. Please try again in 17m3.408s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}})
-
 ## Secondary LLM-as-judge column
 
 Not used. Scoring is rule-based: exact category match plus required evidence strings.
