@@ -60,9 +60,16 @@ class GroqProvider:
         self._keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
         self._key_index = 0
         self._clients = [Groq(api_key=k) for k in self._keys]
+        self._dead_keys: set[int] = set()
 
     def _client_for_key(self, index: int):
         return self._clients[index % len(self._clients)]
+
+    def _is_dead(self, index: int) -> bool:
+        return index in self._dead_keys
+
+    def _mark_dead(self, index: int):
+        self._dead_keys.add(index)
 
     def complete(
         self,
@@ -80,8 +87,11 @@ class GroqProvider:
             }
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
-            # Try each API key on 429 before moving to the next model.
+            # Try each live API key on 429 before moving to the next model.
+            # 401 (invalid key) marks that key dead permanently.
             for key_idx in range(len(self._keys)):
+                if self._is_dead(key_idx):
+                    continue
                 for attempt in range(self._max_retries):
                     try:
                         self.stats.calls += 1
@@ -101,8 +111,14 @@ class GroqProvider:
                         time.sleep(min(32.0, 2**attempt))
                         break  # try next key instead of retrying same key
                     except Exception as exc:
+                        err_msg = str(exc).lower()
+                        # 401 invalid API key: mark this key dead, never retry it.
+                        if "401" in err_msg or "invalid api key" in err_msg:
+                            self._mark_dead(key_idx)
+                            last_error = exc
+                            break  # try next key
                         # Groq returns 413 for TPM oversize; shrinking happens in the agent.
-                        if "rate_limit" in str(exc).lower() or "413" in str(exc):
+                        if "rate_limit" in err_msg or "413" in err_msg:
                             self.stats.retries_429 += 1
                             last_error = exc
                             time.sleep(min(32.0, 2**attempt))
