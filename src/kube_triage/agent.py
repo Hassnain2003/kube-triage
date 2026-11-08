@@ -33,6 +33,34 @@ Allowed root_cause_category values:
 Output must be valid JSON matching the schema you are given. Do not wrap it in markdown.
 """
 
+REPORT_JSON_HINT = """{
+  "root_cause_category": "crashloop_bad_config",
+  "explanation": "short explanation",
+  "evidence": [{"tool": "list_pods", "source_ref": "list_pods:1", "excerpt": "CrashLoopBackOff"}],
+  "suggested_fix": "text or unified diff",
+  "confidence": 0.0
+}"""
+
+_HINTS = (
+    "CrashLoopBackOff",
+    "OOMKilled",
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "CRASH_ON_START",
+    "WORKER_STUCK",
+    "redis.invalid",
+    "replicas: 0",
+    "BackOff",
+    "ALLOCATE_MB",
+    "REDIS_HOST",
+    "unhealthy",
+    "timeout",
+    "queue_length",
+    "503",
+    "ScalingReplicaSet",
+    "unavailable",
+)
+
 
 class AgentState(TypedDict, total=False):
     namespace: str
@@ -135,8 +163,7 @@ class TriageAgent:
             raise BudgetExceeded("max tool calls exceeded")
 
     def _observe(self, tool: str, raw: str) -> str:
-        wrapped = wrap_untrusted(tool, raw)
-        return wrapped
+        return wrap_untrusted(tool, compact_cluster_text(raw))
 
     def _run_tool(self, name: str, arguments: dict[str, Any], state: AgentState) -> str:
         self._check_limits()
@@ -153,6 +180,8 @@ class TriageAgent:
         list_out = self._run_tool("list_pods", {"namespace": ns}, state)
         self._run_tool("get_events", {"namespace": ns}, state)
         for deploy in state.get("deployments", []):
+            if len(self.tools.calls) >= self.max_tool_calls:
+                break
             self._run_tool("get_deployment", {"namespace": ns, "name": deploy}, state)
         self._run_tool(
             "get_configmap",
@@ -160,15 +189,20 @@ class TriageAgent:
             state,
         )
         for svc in state.get("services", []):
+            if len(self.tools.calls) >= self.max_tool_calls:
+                break
             self._run_tool("get_service_endpoints", {"namespace": ns, "name": svc}, state)
         pods = parse_pod_names(list_out)
-        for pod in pods[:5]:
-            if len(self.tools.calls) >= self.max_tool_calls - 2:
+        ordered = _pods_by_priority(list_out, pods)
+        # Leave room for the verify node's tool calls.
+        for pod in ordered:
+            if len(self.tools.calls) >= self.max_tool_calls - 3:
                 break
             try:
+                previous = parse_pod_statuses(list_out).get(pod) != "Running"
                 self._run_tool(
                     "get_logs",
-                    {"namespace": ns, "name": pod, "tail": 80, "previous": False},
+                    {"namespace": ns, "name": pod, "tail": 40, "previous": previous},
                     state,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -222,12 +256,12 @@ class TriageAgent:
         return state
 
     def _report(self, state: AgentState) -> AgentState:
-        self._check_limits()
-        schema = DiagnosisReport.model_json_schema()
+        if time.monotonic() - self._started > self.timeout_seconds:
+            raise AgentTimeout("agent timeout exceeded")
         user = (
             "Node: report.\n"
-            "Produce the final diagnosis JSON. Schema:\n"
-            f"{json.dumps(schema)}\n"
+            "Produce the final diagnosis JSON. Example shape:\n"
+            f"{REPORT_JSON_HINT}\n"
             "evidence must cite tool outputs using source_ref values from the evidence.\n"
             "suggested_fix must be human-readable text or a unified diff.\n"
             "Do not claim you changed the cluster.\n"
@@ -272,6 +306,35 @@ class TriageAgent:
             wall_clock_seconds=round(time.monotonic() - self._started, 3) if self._started else 0.0,
             stopped_reason=reason,
         )
+
+
+def compact_cluster_text(raw: str, limit: int = 900) -> str:
+    """Keep symptom lines and drop bulky kubectl YAML (managedFields, etc.)."""
+    lines = [line for line in raw.splitlines() if line.strip()]
+    hits = [line for line in lines if any(hint.lower() in line.lower() for hint in _HINTS)]
+    chosen = hits[:40] if hits else [*lines[:12], *lines[-8:]]
+    text = "\n".join(chosen)
+    if len(text) > limit:
+        return text[:limit] + "\n...[truncated]..."
+    return text
+
+
+def parse_pod_statuses(list_pods_output: str) -> dict[str, str]:
+    """Return {pod_name: status} from `kubectl get pods -o wide` output."""
+    statuses: dict[str, str] = {}
+    for line in list_pods_output.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 3:
+            statuses[parts[0]] = parts[2]
+    return statuses
+
+
+def _pods_by_priority(list_pods_output: str, names: list[str]) -> list[str]:
+    """Non-running pods first: they carry crash/OOM/image symptoms in their logs."""
+    statuses = parse_pod_statuses(list_pods_output)
+    running = [n for n in names if statuses.get(n) == "Running"]
+    others = [n for n in names if n not in running]
+    return others + running
 
 
 def _excerpt(raw: str) -> str:

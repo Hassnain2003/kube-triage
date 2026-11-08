@@ -42,12 +42,12 @@ class GroqProvider:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = DEFAULT_MODEL,
+        model: str | None = None,
         max_retries: int = 6,
     ) -> None:
         from groq import Groq, RateLimitError
 
-        self.model = model
+        self.model = model or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
         self.stats = ProviderStats()
         self._max_retries = max_retries
         self._rate_limit_error = RateLimitError
@@ -85,6 +85,14 @@ class GroqProvider:
                 self.stats.retries_429 += 1
                 last_error = exc
                 time.sleep(min(32.0, 2**attempt))
+            except Exception as exc:
+                # Groq returns 413 for TPM oversize; shrinking happens in the agent.
+                if "rate_limit" in str(exc).lower() or "413" in str(exc):
+                    self.stats.retries_429 += 1
+                    last_error = exc
+                    time.sleep(min(32.0, 2**attempt))
+                    continue
+                raise
         raise RuntimeError(f"Groq rate-limited after {self._max_retries} retries: {last_error}")
 
 

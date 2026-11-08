@@ -41,11 +41,17 @@ class ClusterTools:
         )
 
     def get_events(self, namespace: str) -> str:
-        return self._call(
+        raw = self._call(
             "get_events",
             {"namespace": namespace},
             ["get", "events", "-n", namespace, "--sort-by=.lastTimestamp"],
         )
+        # Keep only the newest events; old events from previous faults pollute
+        # diagnosis (e.g. stale CrashLoopBackOff entries mask a readiness fault).
+        lines = raw.splitlines()
+        if len(lines) > 25:
+            raw = "\n".join(lines[:1] + lines[-24:])
+        return raw
 
     def get_logs(
         self,

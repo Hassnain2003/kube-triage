@@ -24,6 +24,8 @@ GOLDEN_DIR = ROOT / "eval" / "golden"
 OUTPUT_DIR = ROOT / "eval" / "output"
 RESULTS_MD = ROOT / "docs" / "results.md"
 NS = "demo"
+ADMIN_KUBECONFIG = ""
+TRIAGE_KUBECONFIG = ""
 FAULTS = [
     "crashloop_bad_config",
     "oomkilled",
@@ -50,20 +52,28 @@ class RunRecord:
     error: str = ""
 
 
-def _make(target: str, timeout: int = 180) -> None:
+def _make(target: str, timeout: int = 600) -> None:
+    env = os.environ.copy()
+    if ADMIN_KUBECONFIG:
+        env["KUBECONFIG"] = ADMIN_KUBECONFIG
     subprocess.run(
         ["make", target],
         cwd=ROOT,
         check=True,
         timeout=timeout,
+        env=env,
     )
+
+
+def _admin_kubectl(args: list[str]) -> str:
+    return run_kubectl(args, kubeconfig=ADMIN_KUBECONFIG or None)
 
 
 def _healthy(timeout: int = 180) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            out = run_kubectl(
+            out = _admin_kubectl(
                 [
                     "get",
                     "deploy",
@@ -91,10 +101,10 @@ def _healthy(timeout: int = 180) -> None:
 def _wait_symptom(fault: str, timeout: int = 180) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        pods = run_kubectl(["get", "pods", "-n", NS, "-o", "wide"])
+        pods = _admin_kubectl(["get", "pods", "-n", NS, "-o", "wide"])
         describe_blob = pods
         try:
-            describe_blob += "\n" + run_kubectl(["get", "pods", "-n", NS, "-o", "yaml"])
+            describe_blob += "\n" + _admin_kubectl(["get", "pods", "-n", NS, "-o", "yaml"])
         except Exception:
             pass
         if fault == "crashloop_bad_config" and "CrashLoopBackOff" in describe_blob:
@@ -106,7 +116,7 @@ def _wait_symptom(fault: str, timeout: int = 180) -> None:
         ):
             return
         if fault == "readiness_dependency_down":
-            ready = run_kubectl(
+            ready = _admin_kubectl(
                 [
                     "get",
                     "deploy",
@@ -121,14 +131,14 @@ def _wait_symptom(fault: str, timeout: int = 180) -> None:
             if "redis:" in ready and "redis:1" not in ready:
                 return
         if fault == "wrong_dependency_url":
-            cm = run_kubectl(["get", "configmap", "orders-config", "-n", NS, "-o", "yaml"])
+            cm = _admin_kubectl(["get", "configmap", "orders-config", "-n", NS, "-o", "yaml"])
             if "redis.invalid" in cm:
                 return
         if fault == "worker_backlog":
             if "WORKER_STUCK" in describe_blob:
                 return
             try:
-                env = run_kubectl(["get", "deploy", "worker", "-n", NS, "-o", "yaml"])
+                env = _admin_kubectl(["get", "deploy", "worker", "-n", NS, "-o", "yaml"])
                 if "WORKER_STUCK" in env:
                     return
             except Exception:
@@ -244,14 +254,23 @@ def _write_results(meta: dict[str, str], records: list[RunRecord]) -> None:
 
 
 def run_eval(repeats: int = 5) -> int:
+    global ADMIN_KUBECONFIG, TRIAGE_KUBECONFIG
+    # Capture the admin kubeconfig before dotenv points KUBECONFIG at the
+    # read-only ServiceAccount (which cannot inject or restore faults).
+    ADMIN_KUBECONFIG = os.environ.get("KUBECONFIG_ADMIN") or os.environ.get("KUBECONFIG") or ""
     _load_dotenv()
+    if not ADMIN_KUBECONFIG:
+        ADMIN_KUBECONFIG = os.environ.get("KUBECONFIG_ADMIN") or str(
+            Path.home() / ".kube" / "config"
+        )
+    TRIAGE_KUBECONFIG = str(
+        Path(os.environ.get("KUBECONFIG_TRIAGE", ROOT / ".kube" / "triage.kubeconfig")).resolve()
+    )
     meta = _hardware()
     records: list[RunRecord] = []
-    kubeconfig = str((ROOT / ".kube" / "triage.kubeconfig").resolve())
-    os.environ["KUBECONFIG"] = kubeconfig
 
     def runner(args: list[str]) -> str:
-        return run_kubectl(args, kubeconfig=kubeconfig)
+        return run_kubectl(args, kubeconfig=TRIAGE_KUBECONFIG)
 
     for fault in FAULTS:
         golden = yaml.safe_load((GOLDEN_DIR / f"{fault}.yaml").read_text(encoding="utf-8"))
@@ -263,44 +282,52 @@ def run_eval(repeats: int = 5) -> int:
                 _make(f"fault-{fault}")
                 _wait_symptom(fault)
                 tools = ClusterTools(runner)
-                llm = GroqProvider()
+                llm = GroqProvider(model=os.environ.get("GROQ_MODEL", DEFAULT_MODEL))
                 agent = TriageAgent(tools, llm)
                 report = agent.run()
                 correct, evidence_ok = _score(report, golden)
-                records.append(
-                    RunRecord(
-                        fault=fault,
-                        run=i,
-                        correct=correct,
-                        evidence_ok=evidence_ok,
-                        predicted=report.root_cause_category,
-                        tool_calls=report.tool_calls,
-                        input_tokens=report.input_tokens,
-                        output_tokens=report.output_tokens,
-                        wall_clock_seconds=report.wall_clock_seconds,
-                        retries_429=report.retries_429,
-                        stopped_reason=report.stopped_reason,
-                    )
+                rec = RunRecord(
+                    fault=fault,
+                    run=i,
+                    correct=correct,
+                    evidence_ok=evidence_ok,
+                    predicted=report.root_cause_category,
+                    tool_calls=report.tool_calls,
+                    input_tokens=report.input_tokens,
+                    output_tokens=report.output_tokens,
+                    wall_clock_seconds=report.wall_clock_seconds,
+                    retries_429=report.retries_429,
+                    stopped_reason=report.stopped_reason,
+                )
+                records.append(rec)
+                print(
+                    f"{fault} run {i}: predicted={rec.predicted} "
+                    f"correct={rec.correct} evidence={rec.evidence_ok} "
+                    f"tools={rec.tool_calls} in={rec.input_tokens} "
+                    f"out={rec.output_tokens} sec={rec.wall_clock_seconds} "
+                    f"429={rec.retries_429}",
+                    flush=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
-                records.append(
-                    RunRecord(
-                        fault=fault,
-                        run=i,
-                        correct=False,
-                        evidence_ok=False,
-                        predicted="error",
-                        tool_calls=0,
-                        input_tokens=0,
-                        output_tokens=0,
-                        wall_clock_seconds=0.0,
-                        retries_429=0,
-                        stopped_reason="error",
-                        error=error,
-                    )
+                rec = RunRecord(
+                    fault=fault,
+                    run=i,
+                    correct=False,
+                    evidence_ok=False,
+                    predicted="error",
+                    tool_calls=0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    wall_clock_seconds=0.0,
+                    retries_429=0,
+                    stopped_reason="error",
+                    error=error,
                 )
+                records.append(rec)
+                print(f"{fault} run {i}: ERROR {error[:240]}", flush=True)
             finally:
+                _write_results(meta, records)
                 try:
                     _make("restore")
                     _healthy()

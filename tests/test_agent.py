@@ -1,10 +1,19 @@
 from __future__ import annotations
 
-from kube_triage.agent import SYSTEM_PROMPT, TriageAgent
+from kube_triage.agent import SYSTEM_PROMPT, TriageAgent, compact_cluster_text
 from kube_triage.llm import FakeLLMProvider
 from kube_triage.tools import ClusterTools
 from kube_triage.untrusted import END, wrap_untrusted
 from tests.conftest import recorded_runner
+
+
+def test_compact_cluster_text_keeps_symptoms() -> None:
+    bulky = "managedFields:\n- manager: kube-controller\n" * 200
+    bulky += '    status: CrashLoopBackOff\n  CRASH_ON_START: "1"\n'
+    out = compact_cluster_text(bulky)
+    assert "CrashLoopBackOff" in out
+    assert "CRASH_ON_START" in out
+    assert len(out) < 2000
 
 
 def test_untrusted_wrapper_present() -> None:
