@@ -38,13 +38,22 @@ Allowed root_cause_category values and how to recognize them:
   pod itself is healthy (Running, Ready).
 - unknown: no clear signal matches any category above.
 
-Disambiguation rules:
-- If a pod is CrashLoopBackOff → crashloop_bad_config, NOT
-  readiness_dependency_down.
-- If a pod is Running but 0/1 Ready AND a dependency deployment has
-  replicas: 0 → readiness_dependency_down.
-- If READINESS probe fails with 503 AND orders deployment is healthy →
-  readiness_dependency_down, not crashloop.
+Disambiguation decision tree (apply in order):
+1. Is a pod CrashLoopBackOff / BackOff with RestartCount > 0? → crashloop_bad_config
+   (stop here).
+2. Is any pod OOMKilled? → oomkilled.
+3. Is there ImagePullBackOff / ErrImagePull? → imagepull_wrong_tag.
+4. Is a dependency deployment (e.g. redis) at replicas: 0 or ScaledDown, AND the app
+   pod Running but not Ready (0/1)? → readiness_dependency_down.
+5. Is ConfigMap REDIS_HOST pointing to a non-existent host, or do app logs show
+   connection refused to that host? → wrong_dependency_url.
+6. Is WORKER_STUCK=1 set with growing queue_length and API timeouts, while orders pod
+   is healthy? → worker_backlog.
+7. Otherwise → unknown.
+
+Important: a Running-but-not-Ready pod with replicas: 0 dependency is
+readiness_dependency_down, NOT crashloop_bad_config, even if stale CrashLoopBackOff
+events exist from earlier.
 
 {UNTRUSTED_HANDLING_RULES}
 
@@ -159,13 +168,54 @@ class TriageAgent:
         }
         try:
             final = self._graph.invoke(initial)
-        except (BudgetExceeded, AgentTimeout, json.JSONDecodeError) as exc:
+        except (BudgetExceeded, AgentTimeout) as exc:
             return self._failure_report(str(exc), getattr(exc, "reason", type(exc).__name__))
         payload = final.get("report") or {}
         try:
             report = DiagnosisReport.model_validate(payload)
-        except Exception as exc:  # noqa: BLE001
-            return self._failure_report(f"invalid report schema: {exc}", "invalid_schema")
+        except Exception:  # noqa: BLE001
+            # One retry: re-run the report node with a stricter schema reminder.
+            retry_state = dict(final)
+            retry_user = (
+                "Node: report (retry).\n"
+                "Your previous output failed schema validation. Produce valid JSON ONLY "
+                "with keys: root_cause_category, explanation, evidence, suggested_fix, "
+                "confidence. root_cause_category must be one of: crashloop_bad_config, "
+                "oomkilled, imagepull_wrong_tag, readiness_dependency_down, "
+                "wrong_dependency_url, worker_backlog, unknown. evidence must be a list "
+                "of {tool, source_ref, excerpt}. suggested_fix must be text or a unified "
+                "diff. confidence must be 0.0 to 1.0. Do not wrap in markdown.\n"
+                f"Hypothesis: {json.dumps(retry_state.get('hypothesis') or {})}\n\n"
+                + "\n\n".join(retry_state.get("evidence_blocks", []))
+            )
+            result = self.llm.complete(
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": retry_user},
+                ],
+                json_mode=True,
+            )
+            try:
+                data = _parse_json(result.text)
+            except Exception:  # noqa: BLE001
+                data = {
+                    "root_cause_category": "unknown",
+                    "rationale": "parse error",
+                    "verify_tools": [],
+                }
+            if not data.get("evidence"):
+                data["evidence"] = retry_state.get("evidence_items") or [
+                    {"tool": "list_pods", "source_ref": "list_pods:1", "excerpt": "no evidence"}
+                ]
+            try:
+                report = DiagnosisReport.model_validate(data)
+            except Exception as exc2:  # noqa: BLE001
+                return self._failure_report(
+                    f"invalid report schema (retry failed): {exc2}", "invalid_schema"
+                )
+                return self._failure_report(
+                    f"invalid report schema (retry failed): {exc2}", "invalid_schema"
+                )
         report.tool_calls = len(self.tools.calls)
         report.input_tokens = self.llm.stats.input_tokens
         report.output_tokens = self.llm.stats.output_tokens
@@ -223,7 +273,7 @@ class TriageAgent:
         ordered = _pods_by_priority(list_out, pods)
         # Leave room for the verify node's tool calls.
         for pod in ordered:
-            if len(self.tools.calls) >= self.max_tool_calls - 3:
+            if len(self.tools.calls) >= self.max_tool_calls - 5:
                 break
             try:
                 previous = parse_pod_statuses(list_out).get(pod) != "Running"

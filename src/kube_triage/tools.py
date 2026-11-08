@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -46,26 +47,22 @@ class ClusterTools:
             {"namespace": namespace},
             ["get", "events", "-n", namespace, "--sort-by=.lastTimestamp"],
         )
-        # Deduplicate repeated similar events and keep only the newest ones so stale
-        # crashloop entries from previous faults don't mask a readiness fault.
+        # Filter to recent events (last ~15 min) so stale crashloop/OOM entries
+        # from previous fault injections don't mask a readiness fault.
         lines = raw.splitlines()
         if len(lines) <= 25:
             return raw
         header = lines[0]
-        seen: set[str] = set()
-        kept: list[str] = [header]
+        recent: list[str] = [header]
         for line in lines[1:]:
-            parts = line.split(None, 5)
-            if len(parts) >= 6:
-                dedup_key = "|".join(parts[2:6])  # TYPE, REASON, OBJECT, MESSAGE
-            else:
-                dedup_key = line
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            kept.append(line)
-        # Keep header + newest 24 deduped events.
-        return "\n".join([header] + kept[1:][-24:])
+            # kubectl events show relative age like "6m24s" or "59m"; parse rough age.
+            age_token = line.split(None, 1)[0] if line.split() else ""
+            seconds = _parse_age_seconds(age_token)
+            if seconds is None or seconds <= 900:  # 15 minutes
+                recent.append(line)
+        if len(recent) > 25:
+            recent = [header] + recent[1:][-24:]
+        return "\n".join(recent)
 
     def get_logs(
         self,
@@ -115,6 +112,17 @@ class ClusterTools:
         except Exception as exc:  # noqa: BLE001 - surface missing endpoints as data
             endpoints = f"endpoints unavailable: {exc}"
         return f"{svc}\n---\n{endpoints}"
+
+
+def _parse_age_seconds(age: str) -> int | None:
+    """Parse kubectl relative age like '6m24s', '59m', '2h' into seconds."""
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", age.strip())
+    if not m:
+        return None
+    hours = int(m.group(1) or 0)
+    minutes = int(m.group(2) or 0)
+    secs = int(m.group(3) or 0)
+    return hours * 3600 + minutes * 60 + secs
 
 
 def tool_specs() -> list[dict[str, Any]]:
