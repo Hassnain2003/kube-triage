@@ -55,6 +55,17 @@ Important: a Running-but-not-Ready pod with replicas: 0 dependency is
 readiness_dependency_down, NOT crashloop_bad_config, even if stale CrashLoopBackOff
 events exist from earlier.
 
+Required evidence per category (cite these in your report):
+- crashloop_bad_config: pod in CrashLoopBackOff / BackOff, restart count > 0
+- oomkilled: OOMKilled status or memory limit too low
+- imagepull_wrong_tag: ImagePullBackOff / ErrImagePull, wrong image tag
+- readiness_dependency_down: app pod 0/1 Ready, dependency deployment replicas: 0
+  or ScaledDown, dependency endpoints empty.
+- wrong_dependency_url: ConfigMap REDIS_HOST points to non-existent host, or app
+  logs show connection refused to that host.
+- worker_backlog: WORKER_STUCK=1, queue_length growing, API timeouts, worker logs
+  show stuck consumption.
+
 {UNTRUSTED_HANDLING_RULES}
 
 Output must be valid JSON matching the schema you are given. Do not wrap it in markdown.
@@ -125,7 +136,7 @@ class TriageAgent:
         tools: ClusterTools,
         llm: LLMProvider,
         *,
-        max_tool_calls: int = 16,
+        max_tool_calls: int = 24,
         timeout_seconds: float = 180.0,
     ) -> None:
         self.tools = tools
@@ -320,37 +331,47 @@ class TriageAgent:
         category = (state.get("hypothesis") or {}).get("root_cause_category", "unknown")
         ns = state["namespace"]
 
-        # Targeted verification for the most likely category.
+        # Targeted verification per category: collect the exact signals needed
+        # to confirm or reject each hypothesis.
+        targeted: list[tuple[str, dict[str, Any]]] = []
         if category == "readiness_dependency_down":
-            for extra in [
+            targeted = [
                 ("get_deployment", {"name": "redis"}),
                 ("get_service_endpoints", {"name": "redis"}),
                 ("get_configmap", {"name": state["configmap_name"]}),
-            ]:
-                if len(self.tools.calls) >= self.max_tool_calls:
-                    break
-                name, args = extra
-                args = dict(args)
-                args.setdefault("namespace", ns)
-                try:
-                    self._run_tool(name, args, state)
-                except Exception as exc:  # noqa: BLE001
-                    state["evidence_blocks"].append(self._observe(name, f"tool error: {exc}"))
+            ]
+        elif category == "wrong_dependency_url":
+            targeted = [
+                ("get_configmap", {"name": state["configmap_name"]}),
+                ("get_deployment", {"name": "orders"}),
+                ("get_service_endpoints", {"name": "redis"}),
+            ]
+        elif category == "worker_backlog":
+            targeted = [
+                ("get_deployment", {"name": "worker"}),
+                ("get_configmap", {"name": state["configmap_name"]}),
+                ("get_service_endpoints", {"name": "redis"}),
+            ]
         elif category == "crashloop_bad_config":
             pods = parse_pod_names(state.get("last_list_pods", ""))
             for pod in pods[:2]:
-                if len(self.tools.calls) >= self.max_tool_calls:
-                    break
-                try:
-                    self._run_tool(
-                        "get_logs",
-                        {"namespace": ns, "name": pod, "tail": 40, "previous": True},
-                        state,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    state["evidence_blocks"].append(
-                        self._observe(f"get_logs:{pod}", f"tool error: {exc}")
-                    )
+                targeted.append(("get_logs", {"name": pod, "tail": 40, "previous": True}))
+        elif category == "oomkilled":
+            pods = parse_pod_names(state.get("last_list_pods", ""))
+            for pod in pods[:2]:
+                targeted.append(("describe_pod", {"name": pod}))
+        elif category == "imagepull_wrong_tag":
+            targeted = [("get_deployment", {"name": "orders"})]
+
+        for name, args in targeted:
+            if len(self.tools.calls) >= self.max_tool_calls - 3:
+                break
+            args = dict(args)
+            args.setdefault("namespace", ns)
+            try:
+                self._run_tool(name, args, state)
+            except Exception as exc:  # noqa: BLE001
+                state["evidence_blocks"].append(self._observe(name, f"tool error: {exc}"))
 
         for item in requested[:3]:
             if len(self.tools.calls) >= self.max_tool_calls:
