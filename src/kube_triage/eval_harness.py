@@ -150,7 +150,7 @@ def _wait_symptom(fault: str, timeout: int = 180) -> None:
 def _score(report: DiagnosisReport, golden: dict) -> tuple[bool, bool]:
     correct = report.root_cause_category == golden["root_cause_category"]
     blob = json.dumps(report.model_dump()).lower()
-    evidence_ok = all(s.lower() in blob for s in golden.get("required_evidence", []))
+    evidence_ok = all(str(s).lower() in blob for s in golden.get("required_evidence", []))
     return correct, evidence_ok
 
 
