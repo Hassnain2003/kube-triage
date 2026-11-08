@@ -38,22 +38,22 @@ Allowed root_cause_category values and how to recognize them:
   pod itself is healthy (Running, Ready).
 - unknown: no clear signal matches any category above.
 
-Disambiguation decision tree (apply in order):
-1. Is a pod CrashLoopBackOff / BackOff with RestartCount > 0? → crashloop_bad_config
-   (stop here).
-2. Is any pod OOMKilled? → oomkilled.
-3. Is there ImagePullBackOff / ErrImagePull? → imagepull_wrong_tag.
-4. Is a dependency deployment (e.g. redis) at replicas: 0 or ScaledDown, AND the app
-   pod Running but not Ready (0/1)? → readiness_dependency_down.
+Disambiguation decision tree (apply in order, stop at first match):
+1. Is a pod CrashLoopBackOff / BackOff with RestartCount > 0? → crashloop_bad_config (stop here).
+2. Is any pod OOMKilled? → oomkilled (stop here).
+3. Is there ImagePullBackOff / ErrImagePull? → imagepull_wrong_tag (stop here).
+4. Is ANY dependency deployment (e.g. redis) at replicas: 0 or ScaledDown?
+   → readiness_dependency_down (stop here). Even if the app also shows 503s or
+   timeouts, a down dependency means readiness, never worker_backlog.
 5. Is ConfigMap REDIS_HOST pointing to a non-existent host, or do app logs show
-   connection refused to that host? → wrong_dependency_url.
-6. Is WORKER_STUCK=1 set with growing queue_length and API timeouts, while orders pod
-   is healthy? → worker_backlog.
+   connection refused to that host? → wrong_dependency_url (stop here).
+6. Is WORKER_STUCK=1 set with growing queue_length and API timeouts, while ALL
+   dependencies (redis) are healthy (replicas > 0, endpoints present)? →
+   worker_backlog (stop here).
 7. Otherwise → unknown.
 
-Important: a Running-but-not-Ready pod with replicas: 0 dependency is
-readiness_dependency_down, NOT crashloop_bad_config, even if stale CrashLoopBackOff
-events exist from earlier.
+Hard rule: worker_backlog requires ALL dependencies to be Running. If any
+dependency has replicas: 0, it is readiness_dependency_down, period.
 
 Required evidence per category (cite these in your report):
 - crashloop_bad_config: pod in CrashLoopBackOff / BackOff, restart count > 0
@@ -127,6 +127,22 @@ def _parse_json(text: str) -> dict[str, Any]:
         if cleaned.startswith("json"):
             cleaned = cleaned[4:]
         cleaned = cleaned.strip()
+    return json.loads(cleaned)
+
+
+def _parse_json_loose(text: str) -> dict[str, Any]:
+    """Extract a JSON object from text that may contain extra content around it."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    # Find the first { and last } to extract the JSON object.
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return json.loads(cleaned[start : end + 1])
     return json.loads(cleaned)
 
 
@@ -404,14 +420,41 @@ class TriageAgent:
             f"Hypothesis: {json.dumps(state.get('hypothesis') or {})}\n\n"
             + "\n\n".join(state.get("evidence_blocks", []))
         )
-        result = self.llm.complete(
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user},
-            ],
-            json_mode=True,
-        )
-        data = _parse_json(result.text)
+        data = None
+        # Try JSON mode first; if Groq rejects it (json_validate_failed), fall back
+        # to plain text and extract JSON manually from the response.
+        try:
+            result = self.llm.complete(
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user},
+                ],
+                json_mode=True,
+            )
+            data = _parse_json(result.text)
+        except Exception as first_err:  # noqa: BLE001
+            err_msg = str(first_err).lower()
+            if "json_validate_failed" in err_msg or "failed to generate json" in err_msg:
+                result = self.llm.complete(
+                    [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": user
+                            + "\n\nReturn ONLY valid JSON, no markdown fences, no extra text.",
+                        },
+                    ],
+                    json_mode=False,
+                )
+                data = _parse_json_loose(result.text)
+            else:
+                raise
+        if data is None:
+            data = {
+                "root_cause_category": "unknown",
+                "rationale": "parse error",
+                "verify_tools": [],
+            }
         if not data.get("evidence"):
             data["evidence"] = state.get("evidence_items") or [
                 {"tool": "list_pods", "source_ref": "list_pods:1", "excerpt": "no evidence"}
