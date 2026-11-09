@@ -39,9 +39,13 @@ Allowed root_cause_category values and how to recognize them:
 - unknown: no clear signal matches any category above.
 
 Disambiguation decision tree (apply in order, stop at first match):
-1. Is a pod CrashLoopBackOff / BackOff with RestartCount > 0? → crashloop_bad_config (stop here).
-2. Is any pod OOMKilled? → oomkilled (stop here).
-3. Is there ImagePullBackOff / ErrImagePull? → imagepull_wrong_tag (stop here).
+1. Is any pod/container terminated with reason OOMKilled, or does the pod status
+   show OOMKilled (even if the pod is now CrashLoopBackOff)? → oomkilled (stop
+   here). OOM kills cause restarts; CrashLoopBackOff is a symptom of the OOM,
+   not a config crash.
+2. Is there ImagePullBackOff / ErrImagePull? → imagepull_wrong_tag (stop here).
+3. Is a pod CrashLoopBackOff / BackOff with RestartCount > 0 AND no OOMKilled
+   reason visible? → crashloop_bad_config (stop here).
 4. Is ANY dependency deployment (e.g. redis) at replicas: 0 or ScaledDown?
    → readiness_dependency_down (stop here). Even if the app also shows 503s or
    timeouts, a down dependency means readiness, never worker_backlog.
