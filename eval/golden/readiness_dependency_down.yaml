@@ -1,0 +1,4 @@
+root_cause_category: readiness_dependency_down
+required_evidence:
+  - redis
+  - "replicas: 0"

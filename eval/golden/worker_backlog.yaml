@@ -1,0 +1,3 @@
+root_cause_category: worker_backlog
+required_evidence:
+  - WORKER_STUCK

@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ruff
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+      - name: Pytest with coverage
+        run: pytest --cov=kube_triage --cov-report=term-missing
+      - name: MCP server import
+        run: python -c "from kube_triage.mcp_server import mcp, main; print('mcp ok')"
+
+  rbac-kind:
+    # Optional. kind on GitHub Actions is usually fine but can flake on nested virtualization
+    # or image pull timeouts. Treat a failure here as infra, not as an agent-logic failure.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: kube-triage
+          config: kind.yaml
+      - name: Install kubectl plugins already present
+        run: kubectl version --client
+      - name: Build and load demo images
+        run: |
+          docker build -t kube-triage-orders:dev demo-app/orders
+          docker build -t kube-triage-worker:dev demo-app/worker
+          kind load docker-image kube-triage-orders:dev kube-triage-worker:dev --name kube-triage
+      - name: Apply manifests and RBAC check
+        run: |
+          kubectl apply -f demo-app/k8s
+          kubectl -n demo rollout status deploy/redis --timeout=120s
+          kubectl -n demo rollout status deploy/orders --timeout=180s
+          kubectl -n demo rollout status deploy/worker --timeout=120s
+          chmod +x scripts/check_rbac.sh
+          ./scripts/check_rbac.sh

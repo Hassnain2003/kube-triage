@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-config
+  namespace: demo
+data:
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  ORDERS_CONFIG: "{}"
+  CRASH_ON_START: "0"
+  ALLOCATE_MB: "0"
+  WORKER_STUCK: "0"
+  # The value below is a dummy so redaction tests and runtime redaction have a target.
+  API_TOKEN: "not-a-real-secret-placeholder"

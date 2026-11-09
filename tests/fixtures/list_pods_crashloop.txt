@@ -1,0 +1,4 @@
+NAME                      READY   STATUS             RESTARTS   AGE   IP           NODE
+orders-6d7f9c4b8d-abcde   0/1     CrashLoopBackOff   4          45s   10.244.0.8   kube-triage-control-plane
+worker-7c8f5d6b9c-fghij   1/1     Running            0          2m    10.244.0.9   kube-triage-control-plane
+redis-5d4c3b2a1e-klmno    1/1     Running            0          2m    10.244.0.10  kube-triage-control-plane
